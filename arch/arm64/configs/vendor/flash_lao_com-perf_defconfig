@@ -923,6 +923,9 @@ CONFIG_NET_NS=y
 CONFIG_USER_NS=y
 CONFIG_CGROUP_PIDS=y
 
+# IPC namespace 依赖 SYSVIPC，容器需要
+CONFIG_SYSVIPC=y
+
 # ---- fnOS (飞牛) storage/filesystem requirements ----
 # md RAID for 存储池
 CONFIG_MD_RAID0=m

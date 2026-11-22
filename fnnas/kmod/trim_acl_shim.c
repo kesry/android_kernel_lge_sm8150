@@ -46,6 +46,17 @@
 #include <linux/miscdevice.h>
 #include <linux/uaccess.h>
 
+/*
+ * 版本适配：
+ *   4.14 (本 LG sm8150 树) 的 xattr_handler 没有 mnt_idmap 参数，
+ *   __vfs_setxattr 也没有 idmap；主线 6.3+ 才引入 mnt_idmap。
+ *   本树已回移了 handler->name 精确匹配，所以 .name/.prefix=NULL 写法通用。
+ */
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+#define TRIM_HAVE_MNT_IDMAP 1
+#endif
+
 #define XATTR_TRIM_ACL   "system.trim_acl"
 #define XATTR_BACKEND    "user.trim_acl"
 #define TRASHBIN_NAME    "trim-trashbin"
@@ -85,14 +96,20 @@ static int trim_get(const struct xattr_handler *handler,
 }
 
 static int trim_set(const struct xattr_handler *handler,
+#ifdef TRIM_HAVE_MNT_IDMAP
 		    struct mnt_idmap *idmap,
+#endif
 		    struct dentry *dentry, struct inode *inode,
 		    const char *name, const void *value,
 		    size_t size, int flags)
 {
 	int ret;
 
-	ret = __vfs_setxattr(idmap, dentry, inode, XATTR_BACKEND,
+	ret = __vfs_setxattr(
+#ifdef TRIM_HAVE_MNT_IDMAP
+			     idmap,
+#endif
+			     dentry, inode, XATTR_BACKEND,
 			     value, size, flags);
 	pr_debug("trim_acl_shim: set(%s) size=%zu -> %d\n",
 		 dentry->d_name.name, size, ret);
