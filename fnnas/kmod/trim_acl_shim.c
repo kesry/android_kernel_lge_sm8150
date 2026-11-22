@@ -57,6 +57,18 @@
 #define TRIM_HAVE_MNT_IDMAP 1
 #endif
 
+/*
+ * sb->s_xattr 的类型在不同版本不同：
+ *   4.14 (本树): const struct xattr_handler **
+ *   6.x        : const struct xattr_handler * const *
+ * 用别名 + 仅在比较处转 void* 规避 -Wincompatible-pointer-types-discards-qualifiers
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+typedef const struct xattr_handler * const *trim_sxattr_t;
+#else
+typedef const struct xattr_handler **trim_sxattr_t;
+#endif
+
 #define XATTR_TRIM_ACL   "system.trim_acl"
 #define XATTR_BACKEND    "user.trim_acl"
 #define TRASHBIN_NAME    "trim-trashbin"
@@ -69,7 +81,7 @@ MODULE_PARM_DESC(mounts, "挂载点列表，逗号分隔，默认 /vol1");
 struct sb_patch {
 	struct list_head list;
 	struct super_block *sb;
-	const struct xattr_handler * const *orig;
+	trim_sxattr_t orig;
 	const struct xattr_handler **replacement;
 };
 
@@ -147,7 +159,7 @@ static const struct xattr_handler trim_acl_handler = {
 static int patch_sb(struct super_block *sb)
 {
 	struct sb_patch *p;
-	const struct xattr_handler * const *orig;
+	trim_sxattr_t orig;
 	const struct xattr_handler **arr;
 	size_t n = 0, i;
 
@@ -184,7 +196,7 @@ static int patch_sb(struct super_block *sb)
 	p->replacement = arr;
 	list_add(&p->list, &g_patched);
 
-	sb->s_xattr = (const struct xattr_handler * const *)arr;
+	sb->s_xattr = arr;
 
 	pr_info("trim_acl_shim: patched %s (%s), xattr %zu -> %zu\n",
 		sb->s_id, sb->s_type->name, n, n + 1);
@@ -196,8 +208,8 @@ static void unpatch_all(void)
 	struct sb_patch *p, *tmp;
 
 	list_for_each_entry_safe(p, tmp, &g_patched, list) {
-		if (p->sb && p->sb->s_xattr ==
-		    (const struct xattr_handler * const *)p->replacement)
+		if (p->sb &&
+		    (const void *)p->sb->s_xattr == (const void *)p->replacement)
 			p->sb->s_xattr = p->orig;
 		list_del(&p->list);
 		kfree(p->replacement);
