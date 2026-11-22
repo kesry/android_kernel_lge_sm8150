@@ -17,6 +17,8 @@ concurrency:
 
 env:
   ARCH: arm64
+  # 必须指定交叉前缀，否则 clang 按宿主机 x86_64 编译（asm("sp") 会报错）
+  CROSS_COMPILE: aarch64-linux-gnu-
   EXPECTED_KERNELRELEASE: "4.14.355-openela-perf+"
 
 jobs:
@@ -35,7 +37,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             bc bison flex libssl-dev libelf-dev \
-            clang-18 lld-18 llvm-18 python3 make
+            clang-18 lld-18 llvm-18 binutils-aarch64-linux-gnu python3 make
           # 统一暴露 llvm-18 工具到 PATH (clang/ld.lld/llvm-ar/llvm-nm/...)
           for f in /usr/lib/llvm-18/bin/*; do
             sudo ln -sf "$f" /usr/local/bin/"$(basename "$f")"
