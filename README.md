@@ -55,6 +55,63 @@ dts/                                 板级 DTS（待写：flashlmdd）
 patches/                             内核补丁
 ```
 
+## 打包与启动（研究结论）
+
+### boot.img 的硬参数（来自本机原厂 `BoardConfigCommon.mk`，不是猜的）
+
+```
+BOARD_BOOT_HEADER_VERSION    := 2
+BOARD_KERNEL_PAGESIZE        := 4096
+BOARD_KERNEL_BASE            := 0x00000000
+BOARD_KERNEL_OFFSET          := 0x00008000
+BOARD_RAMDISK_OFFSET         := 0x01000000
+BOARD_KERNEL_TAGS_OFFSET     := 0x00000100
+BOARD_DTB_OFFSET             := 0x01f00000
+BOARD_KERNEL_IMAGE_NAME      := Image.gz
+BOARD_INCLUDE_DTB_IN_BOOTIMG := true      # DTB 必须放进 boot.img
+BOARD_KERNEL_SEPARATED_DTBO  := true
+BOARD_USES_RECOVERY_AS_BOOT  := true      # 无独立 recovery 分区
+TARGET_NO_RECOVERY           := true
+```
+
+`scripts/mk-bootimg.sh` 用这些参数调 AOSP `mkbootimg.py` 生成 boot.img。
+
+### 三个会让人白折腾一整天的坑（同 SoC 项目实测）
+
+1. **DTB 里 `ufshc@1d84000` / `phy@1d87000` 默认是 `disabled`**
+   上游 `sm8150.dtsi` 把 UFS 关着，板级 DTS 不覆写就没有 `/dev/sd*`。
+   现象极具误导：屏幕上有企鹅、日志停在原地、USB 也扫不到，看起来像"内核崩了"，
+   实际是 initramfs 在等一个永不出现的根设备。
+   → `scripts/check-dtb.sh` 做编译期门禁，不 okay 就不许打包。
+
+2. **`console=` 取最后一个，指向 USB 串口会把整机冻住**
+   若 cmdline 写成 `console=tty0 console=ttyGS0`，userspace 的 `/dev/console` 是 ttyGS0；
+   PC 侧没人读 COM 口 → ACM 缓冲灌满 → printk/写控制台阻塞 → systemd 全体卡死
+   （实测 `dev-sda31.device` 用了 9 分钟，dbus 超时连带 NetworkManager 永远不起）。
+   → 正常启动只用 `console=tty0`；USB 串口只给 userspace 的 getty/维护 shell 用。
+
+3. **改了 DTB 必须重新打包 boot.img**
+   DTB 在 boot 镜像里，不刷 boot 等于没改。刷前核对文件 mtime/md5，
+   别把旧的 boot 镜像刷进去（同 SoC 项目踩过一次）。
+
+### 三条启动路径（按风险从低到高）
+
+| 路径 | 命令 | 风险 | 用途 |
+|---|---|---|---|
+| 内存启动 | `fastboot boot boot.img` | 不写分区，重启即回 Android | **首选**，迭代内核 |
+| 写非活动槽 | `fastboot flash boot_a boot.img` | 活动槽仍是 `_b`，坏了不影响 | 验证接近真机 |
+| 写活动槽 | `fastboot flash boot_b boot.img` | 起不来就进不了 rec（本案 rec 在 boot ramdisk 里） | 最后一步 |
+
+⚠️ `fastboot boot` 在 **fastbootd**（从 recovery 起的 userspace fastboot）**不支持**，
+会报 `Unrecognized command boot`。必须进**真 bootloader 的 fastboot**（音量下 + 插线）。
+
+### DTB 与 bootloader 的关系（待验证）
+
+LG 的 ABL 会把 `dtbo` 分区叠加到内核 DTB 上，叠加需要设备树里有 `__symbols__`。
+主线设备树默认不带符号表，叠加失败时 bootloader **可能静默拒绝**（不报错）。
+首启若出现"`fastboot boot` 返回 OKAY 但完全没反应"，优先怀疑这一点，
+按 `references/bootloader-and-boot.md` 的做法在打包期注入符号占位节点。
+
 ## 待办（按顺序）
 
 1. 上游 `sm8150-mtp` 基线构建通过（本 CI）
