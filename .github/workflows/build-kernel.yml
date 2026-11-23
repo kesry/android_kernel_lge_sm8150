@@ -150,6 +150,22 @@ jobs:
       - name: ccache stats after build
         run: ccache -s || true
 
+      - name: Assert 48-bit VA (SM8150 is ARMv8.2-A, no LPA2)
+        run: |
+          set -e
+          CFG=linux/out/.config
+          grep -q '^CONFIG_ARM64_VA_BITS_48=y' "$CFG" || { echo "::error::VA_BITS_48 missing"; exit 1; }
+          grep -q '^CONFIG_ARM64_VA_BITS=48$' "$CFG" || { echo "::error::VA_BITS != 48"; exit 1; }
+          grep -q '^CONFIG_ARM64_PA_BITS_48=y' "$CFG" || { echo "::error::PA_BITS_48 missing"; exit 1; }
+          if grep -q '^CONFIG_ARM64_VA_BITS_52=y' "$CFG"; then
+            echo "::error::VA_BITS_52 still on -> kernel dies in MMU setup on SM8150"; exit 1
+          fi
+          if grep -q '^CONFIG_ARM64_LPA2=y' "$CFG"; then
+            echo "::error::LPA2 still on (needs ARMv8.7)"; exit 1
+          fi
+          echo "OK: 48-bit VA/PA, no LPA2"
+          grep -E '^CONFIG_ARM64_(VA_BITS|PA_BITS|LPA2|MTE|BTI|POE|HAFT|EPAN)' "$CFG" | sort || true
+
       - name: Assert kernel Image entry is LK-enterable
         run: |
           set -e
