@@ -37,10 +37,12 @@ cat >> "$DST" <<'EOF'
  *           sm8150-flash_common/sm8150-flash_common-storage.dtsi 等
  */
 
-/* UFS：原厂额外声明 vdd-hba 与低压支持，补上 */
+/* UFS：原厂额外声明低压模式与 vddp-ref-clk，补上
+ * 注意：不要加 vdd-hba-supply = <&ufs_phy_gdsc> ——
+ * 那是 LG 下游内核的 label，主线 sm8150.dtsi 里没有，dtc 会报
+ * "Reference to non-existent node or label" 直接编译失败。
+ */
 &ufs_mem_hc {
-	vdd-hba-supply = <&ufs_phy_gdsc>;
-	vdd-hba-fixed-regulator;
 	vcc-low-voltage-sup;
 	vcc-voltage-level = <2504000 2950000>;
 	qcom,vddp-ref-clk-supply = <&vreg_l9a_1p2>;

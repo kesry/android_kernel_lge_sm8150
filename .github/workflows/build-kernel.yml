@@ -85,10 +85,9 @@ jobs:
             bash scripts/gen-board-dts.sh "$PWD/linux"
           fi
           cd linux/arch/arm64/boot/dts/qcom
-          for f in *.dts; do
-            b=$(basename "$f" .dts)
-            grep -q "${b}.dtb" Makefile || echo "dtb-\$(CONFIG_ARCH_QCOM) += ${b}.dtb" >> Makefile
-          done
+          # 只把我们的板子加进 Makefile，不要把目录里几百个 dts 全加进去
+          grep -q "sm8150-flashlmdd.dtb" Makefile || \
+            echo 'dtb-$(CONFIG_ARCH_QCOM) += sm8150-flashlmdd.dtb' >> Makefile
           grep -n "flashlmdd" Makefile || true
 
       - name: Configure (defconfig + optional feature fragment)
@@ -104,23 +103,26 @@ jobs:
           echo "=== key options ==="
           grep -E '^CONFIG_(ARCH_QCOM|ARCH_SM8150|PINCTRL_SM8150|QCOM_|DRM_MSM|PID_NS|IPC_NS|USER_NS|OVERLAY_FS|BRIDGE|VETH|NETFILTER|CGROUPS|CGROUP_PIDS|SECCOMP|BTRFS_FS|XFS_FS|F2FS_FS|EXFAT_FS|NTFS3_FS|CIFS|NFS_FS|NFSD|FUSE_FS|SQUASHFS|ZRAM|KVM|WIREGUARD|USB_CONFIGFS|UFS_QCOM|PHY_QCOM_QMP_UFS|TYPEC)=' out/.config | sort || true
 
-      - name: Build Image.gz + dtbs + modules
+      - name: Build board DTB first (fail fast)
         run: |
           cd linux
-          # -@ 让 dtc 生成 __symbols__：LG 的 ABL 会把 dtbo 分区叠加到内核 DTB 上，
-          # 叠加需要符号表，缺失时 bootloader 可能静默拒绝（fastboot boot 还回 OKAY）。
-          make O=out LLVM=1 DTC_FLAGS="-@" -j"$(nproc)" Image.gz dtbs modules
+          # 只编我们这一块板子的 DTB；`dtbs` 会把几百个无关设备树全编一遍
+          make O=out LLVM=1 DTC_FLAGS="-@" -j"$(nproc)" \
+            arch/arm64/boot/dts/qcom/sm8150-flashlmdd.dtb
 
       - name: DTB gate (ufshc/phy must be okay)
         run: |
           set -e
-          shopt -s nullglob
-          dtbs=(linux/out/arch/arm64/boot/dts/qcom/sm8150-flashlmdd.dtb)
-          if [ ! -f "${dtbs[0]}" ]; then
-            echo "::error::board dtb not built"
-            exit 1
-          fi
-          bash scripts/check-dtb.sh "${dtbs[0]}" | tee dtb-gate.log
+          DTB=linux/out/arch/arm64/boot/dts/qcom/sm8150-flashlmdd.dtb
+          [ -f "$DTB" ] || { echo "::error::board dtb not built"; exit 1; }
+          bash scripts/check-dtb.sh "$DTB" | tee dtb-gate.log
+
+      - name: Build Image.gz + modules
+        run: |
+          cd linux
+          # -@ 让 dtc 生成 __symbols__：LG 的 ABL 会把 dtbo 分区叠加到内核 DTB 上，
+          # 叠加需要符号表，缺失时 bootloader 可能静默拒绝（fastboot boot 还回 OKAY）。
+          make O=out LLVM=1 DTC_FLAGS="-@" -j"$(nproc)" Image.gz modules
 
       - name: Collect artifacts
         run: |
