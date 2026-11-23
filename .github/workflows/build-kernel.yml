@@ -27,6 +27,13 @@ env:
   ARCH: arm64
   KVER: ${{ github.event.inputs.kernel_version || 'v7.3.6' }}
   ALL_FEATURES: ${{ github.event.inputs.all_features || '1' }}
+  # ---- ccache：避免每次全量重编（一次全量约 40 分钟，命中缓存后可降到几分钟）----
+  CCACHE_DIR: /home/runner/.ccache
+  CCACHE_MAXSIZE: 3G
+  CCACHE_COMPILERCHECK: content
+  CCACHE_NOHASHDIR: 1
+  CCACHE_SLOPPINESS: time_macros,include_file_ctime,include_file_mtime,file_stat_matches
+  CCACHE_BASEDIR: ${{ github.workspace }}
 
 jobs:
   build:
@@ -41,13 +48,27 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            bc bison flex libssl-dev libelf-dev libdw-dev \
+            bc bison flex libssl-dev libelf-dev libdw-dev ccache \
             clang-18 lld-18 llvm-18 python3 make git ca-certificates xz-utils
           for f in /usr/lib/llvm-18/bin/*; do
             sudo ln -sf "$f" /usr/local/bin/"$(basename "$f")"
           done
           clang --version | head -2
+          ccache --version | head -1
           df -h /
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.ccache
+          # key 只跟「内核版本 + 配置/补丁/脚本」有关：
+          # 只改 DTS 或文档时命中率极高，几乎不用重编
+          key: ccache-${{ env.KVER }}-${{ hashFiles('configs/features.config', 'patches/**', 'scripts/**') }}
+          restore-keys: |
+            ccache-${{ env.KVER }}-
+
+      - name: ccache info before build
+        run: ccache -s || true
 
       - name: Fetch mainline kernel ${{ env.KVER }}
         run: |
@@ -110,7 +131,7 @@ jobs:
           # 注意不能写 `make arch/arm64/boot/dts/qcom/xxx.dtb` —— kbuild 的
           # Makefile.dtbs 会把 dts 目录再拼一次，变成重复路径而报
           # "No rule to make target 'arch/arm64/boot/dts/arch/arm64/...'"
-          make O=out LLVM=1 DTC_FLAGS="-@" -j"$(nproc)" dtbs
+          make O=out LLVM=1 CC="ccache clang" DTC_FLAGS="-@" -j"$(nproc)" dtbs
 
       - name: DTB gate (ufshc/phy must be okay)
         run: |
@@ -124,7 +145,10 @@ jobs:
           cd linux
           # -@ 让 dtc 生成 __symbols__：LG 的 ABL 会把 dtbo 分区叠加到内核 DTB 上，
           # 叠加需要符号表，缺失时 bootloader 可能静默拒绝（fastboot boot 还回 OKAY）。
-          make O=out LLVM=1 DTC_FLAGS="-@" -j"$(nproc)" Image.gz modules
+          make O=out LLVM=1 CC="ccache clang" DTC_FLAGS="-@" -j"$(nproc)" Image.gz modules
+
+      - name: ccache stats after build
+        run: ccache -s || true
 
       - name: Collect artifacts
         run: |
