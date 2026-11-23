@@ -103,12 +103,14 @@ jobs:
           echo "=== key options ==="
           grep -E '^CONFIG_(ARCH_QCOM|ARCH_SM8150|PINCTRL_SM8150|QCOM_|DRM_MSM|PID_NS|IPC_NS|USER_NS|OVERLAY_FS|BRIDGE|VETH|NETFILTER|CGROUPS|CGROUP_PIDS|SECCOMP|BTRFS_FS|XFS_FS|F2FS_FS|EXFAT_FS|NTFS3_FS|CIFS|NFS_FS|NFSD|FUSE_FS|SQUASHFS|ZRAM|KVM|WIREGUARD|USB_CONFIGFS|UFS_QCOM|PHY_QCOM_QMP_UFS|TYPEC)=' out/.config | sort || true
 
-      - name: Build board DTB first (fail fast)
+      - name: Build DTBs first (fail fast)
         run: |
           cd linux
-          # 只编我们这一块板子的 DTB；`dtbs` 会把几百个无关设备树全编一遍
-          make O=out LLVM=1 DTC_FLAGS="-@" -j"$(nproc)" \
-            arch/arm64/boot/dts/qcom/sm8150-flashlmdd.dtb
+          # 用 `dtbs`：实测全量约 1 分钟，代价很小。
+          # 注意不能写 `make arch/arm64/boot/dts/qcom/xxx.dtb` —— kbuild 的
+          # Makefile.dtbs 会把 dts 目录再拼一次，变成重复路径而报
+          # "No rule to make target 'arch/arm64/boot/dts/arch/arm64/...'"
+          make O=out LLVM=1 DTC_FLAGS="-@" -j"$(nproc)" dtbs
 
       - name: DTB gate (ufshc/phy must be okay)
         run: |
