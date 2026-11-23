@@ -150,6 +150,27 @@ jobs:
       - name: ccache stats after build
         run: ccache -s || true
 
+      - name: Assert kernel Image is bootable by legacy LK
+        run: |
+          set -e
+          IMG=linux/out/arch/arm64/boot/Image.gz
+          [ -f "$IMG" ] || { echo "::error::Image.gz missing"; exit 1; }
+          python3 - "$IMG" <<'PY'
+          import gzip, struct, sys
+          raw = gzip.open(sys.argv[1], "rb").read()
+          code0 = struct.unpack_from("<I", raw, 0)[0]
+          magic = raw[0x38:0x3C]
+          pe_off = struct.unpack_from("<I", raw, 0x3C)[0]
+          print(f"code0=0x{code0:08x} magic={magic} pe_header_offset=0x{pe_off:x}")
+          if raw[0:2] == b"MZ":
+              sys.exit("ERROR: Image starts with MZ (EFI stub). LG's LK jumps to "
+                       "Image+0 and would execute data -> boot fails -> fastboot. "
+                       "Set CONFIG_EFI=n.")
+          if code0 & 0xFC000000 != 0x14000000:
+              sys.exit(f"ERROR: code0 0x{code0:08x} is not an aarch64 branch")
+          print("OK: code0 is a branch, LK can enter the kernel directly")
+          PY
+
       - name: Collect artifacts
         run: |
           set -e
