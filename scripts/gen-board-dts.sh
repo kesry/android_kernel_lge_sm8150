@@ -75,19 +75,28 @@ cat >> "$DST" <<'EOF'
 	};
 };
 
-/* ramoops：首启排查用（地址按上游 mtp 的保留区，取不到就靠 netconsole） */
+/*
+ * ramoops：必须与原厂 reserved-memory 里已有的 ramoops_region 完全一致，
+ * 否则保留内存重叠会让 ramoops 注册失败、panic 日志无处可存。
+ * 原厂 DT（/proc/device-tree/reserved-memory/ramoops_region@b0000000）：
+ *   base = 0xb0000000, size = 0x300000 (3 MiB)
+ */
 / {
 	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
 		ramoops@b0000000 {
 			compatible = "ramoops";
-			reg = <0x0 0xb0000000 0x0 0x400000>;
-			record-size = <0x100000>;
-			console-size = <0x100000>;
+			reg = <0x0 0xb0000000 0x0 0x300000>;
+			record-size = <0x80000>;   /* 512 KiB */
+			console-size = <0x100000>; /* 1 MiB */
+			pmsg-size = <0x80000>;     /* 512 KiB */
 			ftrace-size = <0x0>;
-			pmsg-size = <0x200000>;
+			ecc-size = <16>;
 		};
 	};
 };
+
 EOF
 
 echo "generated: $DST"
