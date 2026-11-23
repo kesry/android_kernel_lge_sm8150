@@ -1,0 +1,130 @@
+name: build-kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: 'Kernel tag (e.g. v7.3.6)'
+        required: false
+        default: 'v7.3.6'
+      all_features:
+        description: 'Merge configs/features.config (1=yes)'
+        required: false
+        default: '1'
+  push:
+    branches: [ mainline ]
+    paths-ignore:
+      - '**/*.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-mainline-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ARCH: arm64
+  KVER: ${{ github.event.inputs.kernel_version || 'v7.3.6' }}
+  ALL_FEATURES: ${{ github.event.inputs.all_features || '1' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout branch (configs / dts / patches)
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev libdw-dev \
+            clang-18 lld-18 llvm-18 python3 make git ca-certificates xz-utils
+          for f in /usr/lib/llvm-18/bin/*; do
+            sudo ln -sf "$f" /usr/local/bin/"$(basename "$f")"
+          done
+          clang --version | head -2
+          df -h /
+
+      - name: Fetch mainline kernel ${{ env.KVER }}
+        run: |
+          set -e
+          git clone --depth 1 --branch "$KVER" \
+            https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git linux
+          cd linux
+          echo "commit=$(git rev-parse HEAD)"
+          echo "KERNEL_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Apply patches
+        run: |
+          set -e
+          shopt -s nullglob
+          pats=(patches/*.patch)
+          [ ${#pats[@]} -eq 0 ] && { echo "no patches"; exit 0; }
+          cd linux
+          for p in ../patches/*.patch; do
+            echo "=== $(basename "$p")"
+            patch -p1 --batch --forward < "$p" || { echo "::error::patch failed: $p"; exit 1; }
+          done
+
+      - name: Install board DTS (if provided)
+        run: |
+          set -e
+          shopt -s nullglob
+          dtsfiles=(dts/*.dts)
+          dtifiles=(dts/*.dtsi)
+          if [ ${#dtsfiles[@]} -eq 0 ] && [ ${#dtifiles[@]} -eq 0 ]; then
+            echo "no board dts yet -> building upstream sm8150 targets only"
+            exit 0
+          fi
+          cp dts/*.dts dts/*.dtsi linux/arch/arm64/boot/dts/qcom/ 2>/dev/null || true
+          cd linux/arch/arm64/boot/dts/qcom
+          for f in *.dts; do
+            b=$(basename "$f" .dts)
+            grep -q "${b}.dtb" Makefile || echo "dtb-\$(CONFIG_ARCH_QCOM) += ${b}.dtb" >> Makefile
+          done
+
+      - name: Configure (defconfig + optional feature fragment)
+        run: |
+          set -e
+          cd linux
+          make O=out LLVM=1 defconfig
+          if [ "$ALL_FEATURES" = "1" ] && [ -f ../configs/features.config ]; then
+            echo "=== merging configs/features.config ==="
+            ./scripts/kconfig/merge_config.sh -O out out/.config ../configs/features.config 2>&1 | tail -40 || true
+            make O=out LLVM=1 olddefconfig
+          fi
+          echo "=== key options ==="
+          grep -E '^CONFIG_(ARCH_QCOM|ARCH_SM8150|PINCTRL_SM8150|QCOM_|DRM_MSM|PID_NS|IPC_NS|USER_NS|OVERLAY_FS|BRIDGE|VETH|NETFILTER|CGROUPS|CGROUP_PIDS|SECCOMP|BTRFS_FS|XFS_FS|F2FS_FS|EXFAT_FS|NTFS3_FS|CIFS|NFS_FS|NFSD|FUSE_FS|SQUASHFS|ZRAM|KVM|WIREGUARD|USB_CONFIGFS|UFS_QCOM|PHY_QCOM_QMP_UFS|TYPEC)=' out/.config | sort || true
+
+      - name: Build Image.gz + dtbs + modules
+        run: |
+          cd linux
+          make O=out LLVM=1 -j"$(nproc)" Image.gz dtbs modules
+
+      - name: Collect artifacts
+        run: |
+          set -e
+          mkdir -p artifact/dtb
+          cp linux/out/arch/arm64/boot/Image.gz artifact/
+          cp linux/out/.config artifact/config
+          echo "$KERNEL_COMMIT" > artifact/kernel_commit.txt
+          echo "$KVER" > artifact/kernel_version.txt
+          find linux/out/arch/arm64/boot/dts/qcom -maxdepth 1 -name 'sm8150*.dtb' -exec cp {} artifact/dtb/ \; 2>/dev/null || true
+          # 模块清单（体积大，只给清单和 tar.gz 名称）
+          make -C linux O=out -s INSTALL_MOD_PATH="$PWD/modstage" modules_install >/dev/null 2>&1 || true
+          if [ -d modstage/lib/modules ]; then
+            ( cd modstage/lib/modules && tar czf "$GITHUB_WORKSPACE/artifact/modules-$(cat "$GITHUB_WORKSPACE/artifact/kernel_version.txt").tar.gz" . ) || true
+          fi
+          ls -lh artifact; ls -lh artifact/dtb || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mainline-${{ env.KVER }}-${{ github.sha }}
+          path: artifact/
+          retention-days: 7
+          if-no-files-found: error
