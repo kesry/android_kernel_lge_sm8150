@@ -73,19 +73,23 @@ jobs:
       - name: Install board DTS (if provided)
         run: |
           set -e
+          # 1) 仓库里自带的 dts（如果以后要完全自写）
           shopt -s nullglob
           dtsfiles=(dts/*.dts)
           dtifiles=(dts/*.dtsi)
-          if [ ${#dtsfiles[@]} -eq 0 ] && [ ${#dtifiles[@]} -eq 0 ]; then
-            echo "no board dts yet -> building upstream sm8150 targets only"
-            exit 0
+          if [ ${#dtsfiles[@]} -gt 0 ] || [ ${#dtifiles[@]} -gt 0 ]; then
+            cp dts/*.dts dts/*.dtsi linux/arch/arm64/boot/dts/qcom/ 2>/dev/null || true
           fi
-          cp dts/*.dts dts/*.dtsi linux/arch/arm64/boot/dts/qcom/ 2>/dev/null || true
+          # 2) 由上游 sm8150-mtp + V50 增量生成板级 DTS
+          if [ -f scripts/gen-board-dts.sh ]; then
+            bash scripts/gen-board-dts.sh "$PWD/linux"
+          fi
           cd linux/arch/arm64/boot/dts/qcom
           for f in *.dts; do
             b=$(basename "$f" .dts)
             grep -q "${b}.dtb" Makefile || echo "dtb-\$(CONFIG_ARCH_QCOM) += ${b}.dtb" >> Makefile
           done
+          grep -n "flashlmdd" Makefile || true
 
       - name: Configure (defconfig + optional feature fragment)
         run: |
@@ -103,7 +107,20 @@ jobs:
       - name: Build Image.gz + dtbs + modules
         run: |
           cd linux
-          make O=out LLVM=1 -j"$(nproc)" Image.gz dtbs modules
+          # -@ 让 dtc 生成 __symbols__：LG 的 ABL 会把 dtbo 分区叠加到内核 DTB 上，
+          # 叠加需要符号表，缺失时 bootloader 可能静默拒绝（fastboot boot 还回 OKAY）。
+          make O=out LLVM=1 DTC_FLAGS="-@" -j"$(nproc)" Image.gz dtbs modules
+
+      - name: DTB gate (ufshc/phy must be okay)
+        run: |
+          set -e
+          shopt -s nullglob
+          dtbs=(linux/out/arch/arm64/boot/dts/qcom/sm8150-flashlmdd.dtb)
+          if [ ! -f "${dtbs[0]}" ]; then
+            echo "::error::board dtb not built"
+            exit 1
+          fi
+          bash scripts/check-dtb.sh "${dtbs[0]}" | tee dtb-gate.log
 
       - name: Collect artifacts
         run: |
