@@ -150,7 +150,7 @@ jobs:
       - name: ccache stats after build
         run: ccache -s || true
 
-      - name: Assert kernel Image is bootable by legacy LK
+      - name: Assert kernel Image entry is LK-enterable
         run: |
           set -e
           IMG=linux/out/arch/arm64/boot/Image.gz
@@ -158,17 +158,21 @@ jobs:
           python3 - "$IMG" <<'PY'
           import gzip, struct, sys
           raw = gzip.open(sys.argv[1], "rb").read()
-          code0 = struct.unpack_from("<I", raw, 0)[0]
+          c0, c1 = struct.unpack_from("<II", raw, 0)
           magic = raw[0x38:0x3C]
           pe_off = struct.unpack_from("<I", raw, 0x3C)[0]
-          print(f"code0=0x{code0:08x} magic={magic} pe_header_offset=0x{pe_off:x}")
-          if raw[0:2] == b"MZ":
-              sys.exit("ERROR: Image starts with MZ (EFI stub). LG's LK jumps to "
-                       "Image+0 and would execute data -> boot fails -> fastboot. "
-                       "Set CONFIG_EFI=n.")
-          if code0 & 0xFC000000 != 0x14000000:
-              sys.exit(f"ERROR: code0 0x{code0:08x} is not an aarch64 branch")
-          print("OK: code0 is a branch, LK can enter the kernel directly")
+          is_branch = lambda w: (w & 0xFC000000) == 0x14000000
+          print(f"code0=0x{c0:08x} code1=0x{c1:08x} magic={magic} pe_header_offset=0x{pe_off:x}")
+          if magic != b"ARMd":
+              sys.exit("ERROR: ARMd magic missing at 0x38, not an arm64 Image")
+          # LK jumps to Image+0 and executes straight through, so entry must be
+          # either a branch at code0, or the EFI ccmp signature + branch at code1.
+          if is_branch(c0):
+              print("OK: code0 is a branch (non-EFI kernel)")
+          elif c0 == 0xfa405a4d and is_branch(c1):
+              print("OK: EFI signature nop at code0 + branch at code1 (EFI kernel)")
+          else:
+              sys.exit(f"ERROR: entry is not LK-enterable: code0=0x{c0:08x} code1=0x{c1:08x}")
           PY
 
       - name: Collect artifacts
