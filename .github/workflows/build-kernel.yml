@@ -179,24 +179,24 @@ jobs:
 
           if magic != b"ARMd":
               sys.exit("ERROR: ARMd magic missing at 0x38, not an arm64 Image")
+          # 我们现在走 edk2-msm UEFI 引导：EFI 镜像（pe_header_offset != 0）是
+          # 正确的，由 UEFI 通过 PE 入口启动。LG 的 LK 路径无法进入这种镜像
+          # （code1 会跳到 PE stub 的 br x8），但那已经不用了。
           if pe_off != 0:
-              sys.exit(f"ERROR: pe_header_offset=0x{pe_off:x} -- EFI wrapper present; "
-                       "its entry goes to the PE stub (`br x8`) which LK cannot use. "
-                       "Set CONFIG_EFI=n.")
+              if c0 != 0xFA405A4D:
+                  sys.exit(f"ERROR: pe_header_offset=0x{pe_off:x} but code0=0x{c0:08x} "
+                           "is not the EFI signature -- unexpected image layout")
+              print("OK: EFI stub image (boot via edk2-msm UEFI, not LG LK)")
+              print(f"    pe_header_offset=0x{pe_off:x}, code1=0x{c1:08x}")
+              sys.exit(0)
 
-          # LK jumps to Image+0 and executes straight through, so the first two
-          # instructions must carry us to primary_entry:
-          #   non-EFI build : code0 = nop (0xd503201f), code1 = b primary_entry
-          #   bare build    : code0 = b primary_entry
+          # 非 EFI 镜像：LK 路径要求 code0/或 code1 是分支
           if is_branch(c0):
               entry = 0
               print("OK: code0 is a branch")
           elif c0 == 0xD503201F and is_branch(c1):
               entry = 4
               print("OK: code0 is nop, code1 is a branch (standard non-EFI header)")
-          elif c0 == 0xFA405A4D:
-              sys.exit("ERROR: EFI signature nop at code0 (MZ/ccmp) -- entry goes to "
-                       "the PE stub, LK dies. Set CONFIG_EFI=n.")
           else:
               sys.exit(f"ERROR: entry not LK-enterable: code0=0x{c0:08x} code1=0x{c1:08x}")
 
