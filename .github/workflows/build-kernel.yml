@@ -27,7 +27,8 @@ env:
   ARCH: arm64
   KVER: ${{ github.event.inputs.kernel_version || 'v7.3.6' }}
   ALL_FEATURES: ${{ github.event.inputs.all_features || '1' }}
-  # ---- ccache：避免每次全量重编（一次全量约 40 分钟，命中缓存后可降到几分钟）----
+  # ---- ccache：每次构建都恢复并使用，不做「命中就跳过编译」的短路。
+  #      配置不变时命中率接近 100%；配置一改（autoconf.h 变）则必然全量重编。----
   CCACHE_DIR: /home/runner/.ccache
   CCACHE_MAXSIZE: 3G
   CCACHE_COMPILERCHECK: content
@@ -38,11 +39,23 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 180
 
     steps:
       - name: Checkout branch (configs / dts / patches)
         uses: actions/checkout@v4
+
+      - name: Compute cache key
+        id: bkey
+        run: |
+          set -e
+          FILES="configs/features.config"
+          [ -d patches ] && FILES="$FILES $(find patches -type f | sort | tr '\n' ' ')"
+          [ -d scripts ] && FILES="$FILES $(find scripts -type f | sort | tr '\n' ' ')"
+          [ -d dts ]     && FILES="$FILES $(find dts -type f | sort | tr '\n' ' ')"
+          H=$(cat $FILES 2>/dev/null | sha256sum | cut -c1-32)
+          echo "hash=$H" >> "$GITHUB_OUTPUT"
+          echo "cache key hash = $H"
 
       - name: Install build dependencies
         run: |
@@ -57,14 +70,14 @@ jobs:
           ccache --version | head -1
           df -h /
 
+      # 始终恢复 ccache：精确 key 命中最好，否则用 restore-keys 拿最近一份
       - name: Restore ccache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: /home/runner/.ccache
-          # key 只跟「内核版本 + 配置/补丁/脚本」有关：
-          # 只改 DTS 或文档时命中率极高，几乎不用重编
-          key: ccache-${{ env.KVER }}-${{ hashFiles('configs/features.config', 'patches/**', 'scripts/**') }}
+          key: ccache-${{ env.KVER }}-${{ steps.bkey.outputs.hash }}-full
           restore-keys: |
+            ccache-${{ env.KVER }}-${{ steps.bkey.outputs.hash }}-
             ccache-${{ env.KVER }}-
 
       - name: ccache info before build
@@ -76,42 +89,30 @@ jobs:
           git clone --depth 1 --branch "$KVER" \
             https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git linux
           cd linux
-          echo "commit=$(git rev-parse HEAD)"
+          git log --oneline -1
           echo "KERNEL_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: Apply patches
         run: |
           set -e
           shopt -s nullglob
-          pats=(patches/*.patch)
-          [ ${#pats[@]} -eq 0 ] && { echo "no patches"; exit 0; }
-          cd linux
-          for p in ../patches/*.patch; do
-            echo "=== $(basename "$p")"
-            patch -p1 --batch --forward < "$p" || { echo "::error::patch failed: $p"; exit 1; }
+          for p in patches/*.patch; do
+            echo "applying $p"
+            ( cd linux && patch -p1 --batch --forward < "../$p" ) || { echo "::error::patch failed: $p"; exit 1; }
           done
+          echo "patches applied"
 
       - name: Install board DTS (if provided)
         run: |
           set -e
-          # 1) 仓库里自带的 dts（如果以后要完全自写）
-          shopt -s nullglob
-          dtsfiles=(dts/*.dts)
-          dtifiles=(dts/*.dtsi)
-          if [ ${#dtsfiles[@]} -gt 0 ] || [ ${#dtifiles[@]} -gt 0 ]; then
-            cp dts/*.dts dts/*.dtsi linux/arch/arm64/boot/dts/qcom/ 2>/dev/null || true
+          if [ -x scripts/gen-board-dts.sh ]; then
+            bash scripts/gen-board-dts.sh linux
           fi
-          # 2) 由上游 sm8150-mtp + V50 增量生成板级 DTS
-          if [ -f scripts/gen-board-dts.sh ]; then
-            bash scripts/gen-board-dts.sh "$PWD/linux"
-          fi
-          cd linux/arch/arm64/boot/dts/qcom
-          # 只把我们的板子加进 Makefile，不要把目录里几百个 dts 全加进去
-          grep -q "sm8150-flashlmdd.dtb" Makefile || \
-            echo 'dtb-$(CONFIG_ARCH_QCOM) += sm8150-flashlmdd.dtb' >> Makefile
-          grep -n "flashlmdd" Makefile || true
+          grep -q 'sm8150-flashlmdd.dtb' linux/arch/arm64/boot/dts/qcom/Makefile || \
+            echo 'dtb-$(CONFIG_ARCH_QCOM) += sm8150-flashlmdd.dtb' >> linux/arch/arm64/boot/dts/qcom/Makefile
+          tail -3 linux/arch/arm64/boot/dts/qcom/Makefile
 
-      - name: Configure (defconfig + optional feature fragment)
+      - name: Configure (defconfig + optional features)
         run: |
           set -e
           cd linux
@@ -123,32 +124,6 @@ jobs:
           fi
           echo "=== key options ==="
           grep -E '^CONFIG_(ARCH_QCOM|ARCH_SM8150|PINCTRL_SM8150|QCOM_|DRM_MSM|PID_NS|IPC_NS|USER_NS|OVERLAY_FS|BRIDGE|VETH|NETFILTER|CGROUPS|CGROUP_PIDS|SECCOMP|BTRFS_FS|XFS_FS|F2FS_FS|EXFAT_FS|NTFS3_FS|CIFS|NFS_FS|NFSD|FUSE_FS|SQUASHFS|ZRAM|KVM|WIREGUARD|USB_CONFIGFS|UFS_QCOM|PHY_QCOM_QMP_UFS|TYPEC)=' out/.config | sort || true
-
-      - name: Build DTBs first (fail fast)
-        run: |
-          cd linux
-          # 用 `dtbs`：实测全量约 1 分钟，代价很小。
-          # 注意不能写 `make arch/arm64/boot/dts/qcom/xxx.dtb` —— kbuild 的
-          # Makefile.dtbs 会把 dts 目录再拼一次，变成重复路径而报
-          # "No rule to make target 'arch/arm64/boot/dts/arch/arm64/...'"
-          make O=out LLVM=1 CC="ccache clang" DTC_FLAGS="-@" -j"$(nproc)" dtbs
-
-      - name: DTB gate (ufshc/phy must be okay)
-        run: |
-          set -e
-          DTB=linux/out/arch/arm64/boot/dts/qcom/sm8150-flashlmdd.dtb
-          [ -f "$DTB" ] || { echo "::error::board dtb not built"; exit 1; }
-          bash scripts/check-dtb.sh "$DTB" | tee dtb-gate.log
-
-      - name: Build Image.gz + modules
-        run: |
-          cd linux
-          # -@ 让 dtc 生成 __symbols__：LG 的 ABL 会把 dtbo 分区叠加到内核 DTB 上，
-          # 叠加需要符号表，缺失时 bootloader 可能静默拒绝（fastboot boot 还回 OKAY）。
-          make O=out LLVM=1 CC="ccache clang" DTC_FLAGS="-@" -j"$(nproc)" Image.gz modules
-
-      - name: ccache stats after build
-        run: ccache -s || true
 
       - name: Assert 48-bit VA (SM8150 is ARMv8.2-A, no LPA2)
         run: |
@@ -164,7 +139,29 @@ jobs:
             echo "::error::LPA2 still on (needs ARMv8.7)"; exit 1
           fi
           echo "OK: 48-bit VA/PA, no LPA2"
-          grep -E '^CONFIG_ARM64_(VA_BITS|PA_BITS|LPA2|MTE|BTI|POE|HAFT|EPAN)' "$CFG" | sort || true
+
+      - name: Build DTBs first (fail fast)
+        run: |
+          cd linux
+          # 用 `dtbs`：实测全量约 1 分钟，代价很小。
+          # 注意不能写 `make arch/arm64/boot/dts/qcom/xxx.dtb` —— kbuild 的
+          # Makefile.dtbs 会把 dts 目录再拼一次，变成重复路径而报
+          # "No rule to make target 'arch/arm64/boot/dts/arch/arm64/...'"
+          make O=out LLVM=1 CC="ccache clang" DTC_FLAGS="-@" -j"$(nproc)" dtbs
+
+      # ------------------------------------------------------------------
+      # 第一段：只编内核镜像。这一步决定能否启动，必须尽快出产物。
+      # 不编模块，所以通常 10 分钟以内完成。
+      # ------------------------------------------------------------------
+      - name: Build Image.gz (kernel only, no modules)
+        run: |
+          cd linux
+          # -@ 让 dtc 生成 __symbols__：LG 的 ABL 会把 dtbo 分区叠加到内核 DTB 上，
+          # 叠加需要符号表，缺失时 bootloader 可能静默拒绝（fastboot boot 还回 OKAY）。
+          make O=out LLVM=1 CC="ccache clang" DTC_FLAGS="-@" -j"$(nproc)" Image.gz
+
+      - name: ccache stats after Image
+        run: ccache -s || true
 
       - name: Assert kernel Image entry is LK-enterable
         run: |
@@ -221,26 +218,73 @@ jobs:
           print("OK: entry is LK-enterable")
           PY
 
-      - name: Collect artifacts
+      - name: DTB gate (ufshc/phy must be okay)
         run: |
           set -e
-          mkdir -p artifact/dtb
-          cp linux/out/arch/arm64/boot/Image.gz artifact/
-          cp linux/out/.config artifact/config
-          echo "$KERNEL_COMMIT" > artifact/kernel_commit.txt
-          echo "$KVER" > artifact/kernel_version.txt
-          find linux/out/arch/arm64/boot/dts/qcom -maxdepth 1 -name 'sm8150*.dtb' -exec cp {} artifact/dtb/ \; 2>/dev/null || true
-          # 模块清单（体积大，只给清单和 tar.gz 名称）
-          make -C linux O=out -s INSTALL_MOD_PATH="$PWD/modstage" modules_install >/dev/null 2>&1 || true
-          if [ -d modstage/lib/modules ]; then
-            ( cd modstage/lib/modules && tar czf "$GITHUB_WORKSPACE/artifact/modules-$(cat "$GITHUB_WORKSPACE/artifact/kernel_version.txt").tar.gz" . ) || true
-          fi
-          ls -lh artifact; ls -lh artifact/dtb || true
+          DTB=linux/out/arch/arm64/boot/dts/qcom/sm8150-flashlmdd.dtb
+          [ -f "$DTB" ] || { echo "::error::board dtb not built"; exit 1; }
+          bash scripts/check-dtb.sh "$DTB" | tee dtb-gate.log
 
-      - name: Upload artifacts
+      - name: Collect kernel artifacts
+        run: |
+          set -e
+          mkdir -p artifact-kernel/dtb
+          cp linux/out/arch/arm64/boot/Image.gz artifact-kernel/
+          cp linux/out/.config artifact-kernel/config
+          echo "$KERNEL_COMMIT" > artifact-kernel/kernel_commit.txt
+          echo "$KVER" > artifact-kernel/kernel_version.txt
+          find linux/out/arch/arm64/boot/dts/qcom -maxdepth 1 -name 'sm8150*.dtb' -exec cp {} artifact-kernel/dtb/ \; 2>/dev/null || true
+          ls -lh artifact-kernel artifact-kernel/dtb
+
+      - name: Upload kernel artifact (available immediately)
         uses: actions/upload-artifact@v4
         with:
-          name: mainline-${{ env.KVER }}-${{ github.sha }}
-          path: artifact/
-          retention-days: 7
+          name: kernel-${{ env.KVER }}-${{ github.sha }}
+          path: artifact-kernel
           if-no-files-found: error
+
+      # 内核一编完就保存缓存：即使后面模块编挂了也不会丢
+      - name: Save ccache after kernel
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: /home/runner/.ccache
+          key: ccache-${{ env.KVER }}-${{ steps.bkey.outputs.hash }}-img
+
+      # ------------------------------------------------------------------
+      # 第二段：模块。慢，而且首启验证用不到，所以放在后面且允许失败，
+      # 绝不能因为它卡住内核迭代。
+      # ------------------------------------------------------------------
+      - name: Build modules (slow, non-blocking)
+        id: mods
+        continue-on-error: true
+        run: |
+          cd linux
+          make O=out LLVM=1 CC="ccache clang" -j"$(nproc)" modules
+
+      - name: Collect module artifacts
+        if: steps.mods.outcome == 'success'
+        run: |
+          set -e
+          mkdir -p artifact-modules
+          make -C linux O=out -s INSTALL_MOD_PATH="$PWD/modstage" modules_install >/dev/null 2>&1 || true
+          if [ -d modstage/lib/modules ]; then
+            ( cd modstage/lib/modules && tar czf "$GITHUB_WORKSPACE/artifact-modules/modules-$KVER.tar.gz" . )
+          fi
+          ls -lh artifact-modules
+
+      - name: Upload modules artifact
+        if: steps.mods.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: modules-${{ env.KVER }}-${{ github.sha }}
+          path: artifact-modules
+          if-no-files-found: warn
+
+      - name: Save ccache after modules
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: /home/runner/.ccache
+          key: ccache-${{ env.KVER }}-${{ steps.bkey.outputs.hash }}-full

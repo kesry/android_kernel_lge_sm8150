@@ -28,6 +28,32 @@ cp "$SRC" "$DST"
 #    保留 mtp 能让现有 quirk 继续命中，减少首启变量）
 sed -i 's|model = "Qualcomm Technologies, Inc. SM8150 MTP";|model = "LG Electronics V50 ThinQ (flashlmdd)";|' "$DST"
 
+# 1b) 设备标识：LG 的 LK 用 qcom,msm-id / qcom,board-id 校验 DTB 是否属于本机。
+#     原厂 DTB 根节点上有这两个属性，主线 DTB 没有 —— 缺了会被直接拒绝，
+#     表现为刷入后 5 秒回到 fastboot、内核根本没执行（实测 2026-11-24：
+#     同一内核配原厂 DTB 能跑 80+ 秒，配我们的 DTB 5 秒就回 fastboot）。
+#     数值取自原厂 DTB：qcom,msm-id = <0x153 0x20000>（0x153 = 339 = SM8150），
+#     qcom,board-id = <0x0 0x0>。
+python3 - "$DST" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+if "qcom,msm-id" in s:
+    print("msm-id already present"); raise SystemExit
+i = s.find("/ {")
+if i < 0:
+    raise SystemExit("root node not found")
+j = s.find("{", i) + 1
+inject = """
+\t/* 设备标识：LG 的 LK 用它校验 DTB 是否属于本机，缺失会拒绝启动 */
+\tqcom,msm-id = <0x153 0x20000>;
+\tqcom,board-id = <0x0 0x0>;
+"""
+s = s[:j] + inject + s[j:]
+open(p, "w").write(s)
+print("injected qcom,msm-id / qcom,board-id")
+PYEOF
+
 # 2) 在文件末尾追加 V50 增量
 cat >> "$DST" <<'EOF'
 

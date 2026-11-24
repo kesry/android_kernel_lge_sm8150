@@ -50,6 +50,18 @@ else
 	echo "[warn] model/compatible 未见 flashlmdd/LGE（首启后必须核对 /proc/device-tree/model）"
 fi
 
+# qcom,msm-id / qcom,board-id：LG 的 LK 用它们校验 DTB 是否属于本机。
+# 缺失会被直接拒绝：刷入后 5 秒回 fastboot，内核根本没执行
+# （实测 2026-11-24：同内核配原厂 DTB 能跑 80+ 秒，配缺这两个属性的 DTB 5 秒就回 fastboot）。
+for prop in "qcom,msm-id" "qcom,board-id"; do
+	if grep -q "$prop" "$DTS"; then
+		echo "[ok]   $prop 存在"
+	else
+		echo "[FAIL] $prop 缺失  ← LG LK 会拒绝该 DTB"
+		fail=1
+	fi
+done
+
 rm -f "$DTS"
 if [ $fail -ne 0 ]; then
 	echo "=== DTB 门禁失败：不要打包、不要刷机 ==="
