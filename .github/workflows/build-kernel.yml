@@ -179,17 +179,46 @@ jobs:
           pe_off = struct.unpack_from("<I", raw, 0x3C)[0]
           is_branch = lambda w: (w & 0xFC000000) == 0x14000000
           print(f"code0=0x{c0:08x} code1=0x{c1:08x} magic={magic} pe_header_offset=0x{pe_off:x}")
+
           if magic != b"ARMd":
               sys.exit("ERROR: ARMd magic missing at 0x38, not an arm64 Image")
-          # LK jumps to Image+0 and executes straight through, so entry must be
-          # either a branch at code0, or the EFI ccmp signature + branch at code1.
+          if pe_off != 0:
+              sys.exit(f"ERROR: pe_header_offset=0x{pe_off:x} -- EFI wrapper present; "
+                       "its entry goes to the PE stub (`br x8`) which LK cannot use. "
+                       "Set CONFIG_EFI=n.")
+
+          # LK jumps to Image+0 and executes straight through, so the first two
+          # instructions must carry us to primary_entry:
+          #   non-EFI build : code0 = nop (0xd503201f), code1 = b primary_entry
+          #   bare build    : code0 = b primary_entry
           if is_branch(c0):
-              print("OK: code0 is a branch (non-EFI kernel) -- LK can enter")
-          elif c0 == 0xfa405a4d:
-              sys.exit("ERROR: EFI image detected. code1 branches to the PE entry "
-                       "(`br x8`), which LG's LK cannot use. Set CONFIG_EFI=n.")
+              entry = 0
+              print("OK: code0 is a branch")
+          elif c0 == 0xD503201F and is_branch(c1):
+              entry = 4
+              print("OK: code0 is nop, code1 is a branch (standard non-EFI header)")
+          elif c0 == 0xFA405A4D:
+              sys.exit("ERROR: EFI signature nop at code0 (MZ/ccmp) -- entry goes to "
+                       "the PE stub, LK dies. Set CONFIG_EFI=n.")
           else:
-              sys.exit(f"ERROR: entry is not LK-enterable: code0=0x{c0:08x} code1=0x{c1:08x}")
+              sys.exit(f"ERROR: entry not LK-enterable: code0=0x{c0:08x} code1=0x{c1:08x}")
+
+          w = c0 if entry == 0 else c1
+          imm = w & 0x03FFFFFF
+          if imm & 0x02000000:
+              imm -= 0x04000000
+          target = entry + imm * 4
+          print(f"entry at offset {entry}, branch target = 0x{target:x} "
+                f"(image size 0x{len(raw):x})")
+          if not (0 <= target < len(raw) - 16):
+              sys.exit(f"ERROR: branch target 0x{target:x} outside the image")
+          at = raw[target:target + 16]
+          print(f"bytes at target: {at.hex(' ')}")
+          if at[:4] == b"\x00\x00\x00\x00":
+              sys.exit("ERROR: branch target points at zeros")
+          if struct.unpack_from("<I", at, 0)[0] == 0xD61F0100:
+              sys.exit("ERROR: branch target is `br x8` (PE/EFI stub entry)")
+          print("OK: entry is LK-enterable")
           PY
 
       - name: Collect artifacts
