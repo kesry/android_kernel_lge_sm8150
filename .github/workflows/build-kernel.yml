@@ -184,9 +184,10 @@ jobs:
           # LK jumps to Image+0 and executes straight through, so entry must be
           # either a branch at code0, or the EFI ccmp signature + branch at code1.
           if is_branch(c0):
-              print("OK: code0 is a branch (non-EFI kernel)")
-          elif c0 == 0xfa405a4d and is_branch(c1):
-              print("OK: EFI signature nop at code0 + branch at code1 (EFI kernel)")
+              print("OK: code0 is a branch (non-EFI kernel) -- LK can enter")
+          elif c0 == 0xfa405a4d:
+              sys.exit("ERROR: EFI image detected. code1 branches to the PE entry "
+                       "(`br x8`), which LG's LK cannot use. Set CONFIG_EFI=n.")
           else:
               sys.exit(f"ERROR: entry is not LK-enterable: code0=0x{c0:08x} code1=0x{c1:08x}")
           PY
